@@ -1,0 +1,11 @@
+                                                      List of databases
+   Name    |   Owner    | Encoding | Locale Provider |   Collate   |    Ctype    | ICU Locale | ICU Rules | Access privileges 
+-----------+------------+----------+-----------------+-------------+-------------+------------+-----------+-------------------
+ books_db  | books_user | UTF8     | libc            | en_US.UTF-8 | en_US.UTF-8 |            |           | 
+ postgres  | nitort     | UTF8     | libc            | en_US.UTF-8 | en_US.UTF-8 |            |           | 
+ template0 | nitort     | UTF8     | libc            | en_US.UTF-8 | en_US.UTF-8 |            |           | =c/nitort        +
+           |            |          |                 |             |             |            |           | nitort=CTc/nitort
+ template1 | nitort     | UTF8     | libc            | en_US.UTF-8 | en_US.UTF-8 |            |           | =c/nitort        +
+           |            |          |                 |             |             |            |           | nitort=CTc/nitort
+(4 rows)
+
