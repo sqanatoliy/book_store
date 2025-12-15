@@ -33,6 +33,8 @@ def connect_to_db() -> Engine:
     name = config("DB_NAME", default="books_db")
     user = config("DB_USER", default="")
     password = config("DB_PASSWORD", default="")
+    sslmode = config("DB_SSLMODE", default="require")
+    channel_binding = config("DB_CHANNEL_BINDING", default="require")
 
     missing = [k for k, v in {
         "DB_HOST": host,
@@ -51,7 +53,8 @@ def connect_to_db() -> Engine:
         password=password,
         host=host,
         port=port,
-        database=name
+        database=name,
+        query={"sslmode": sslmode, "channel_binding": channel_binding},
     )
 
     try:
