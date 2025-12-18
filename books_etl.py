@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""books_etl.py (v4)
+"""books_etl.py
 
 ETL процес для обробки даних книг з PostgreSQL:
 - Extract: читаємо книги з таблиці books де last_updated >= cutoff_date
@@ -161,7 +161,7 @@ def extract_books_iter(engine: Engine, cutoff_dt: datetime, *, chunksize: int) -
     try:
         for chunk in pd.read_sql_query(sql, conn, params={"cutoff": cutoff_dt}, chunksize=chunksize):
             yield chunk
-    except Exception as e:  # noqa: BLE001
+    except Exception as e: 
         raise RuntimeError(f"Помилка зчитування даних з таблиці books: {e}") from e
     finally:
         conn.close()
