@@ -1,25 +1,37 @@
-
 #!/usr/bin/env python3
-"""books_etl.py (v3)
+"""books_etl.py (v4)
 
 ETL процес для обробки даних книг з PostgreSQL:
-- Витягнути книги з таблиці books де last_updated >= cutoff_date
-- Трансформувати дані згідно бізнес-правил
-- Завантажити трансформовані дані в books_processed
+- Extract: читаємо книги з таблиці books де last_updated >= cutoff_date
+- Transform: original_price, rounded_price (1 знак), price_category budget/premium, видаляємо price
+- Load: записуємо результат у books_processed
 
-Покращення після відгуку:
+Покращення (після фідбеку):
 - logging замість print()
-- retry з backoff (конект/запис)
-- chunked processing (ETL_CHUNKSIZE)
-- idempotent load: перед вставкою видаляємо books_processed по book_id (анти-дублікат)
+- retry з backoff (tenacity) для підключення та запису (тільки transient помилки)
+- chunked processing (ETL_CHUNKSIZE) — обробка частинами, щоб не вантажити все в RAM
+- idempotent load: перед вставкою видаляємо записи books_processed для book_id, що обробляються (анти-дублікат)
+- рекомендований підхід: pandas читає/пише через SQLAlchemy Connection, а не Engine
 
+Запуск:
+  python books_etl.py 2025-01-01
+
+ENV:
+  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+  DB_SSLMODE (default=require)  # важливо для Neon
+  DB_CHANNEL_BINDING (optional) # інколи потрібне для pooled-host в Neon
+  ETL_CHUNKSIZE (default=5000)
+  LOG_LEVEL (default=INFO)
+  ENV_FILE (optional)           # наприклад ENV_FILE=.env.neon
+
+Залежності:
+  pip install pandas sqlalchemy psycopg2-binary python-decouple tenacity
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import random
 import sys
 import time
 from datetime import datetime
@@ -29,18 +41,18 @@ from typing import Iterator, Optional
 import pandas as pd
 from decouple import AutoConfig, Config, RepositoryEnv
 from sqlalchemy import bindparam, create_engine, text
-from sqlalchemy.engine import Engine, URL
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.engine import Connection, Engine, URL
+from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
+from tenacity import before_sleep_log, retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger("books_etl")
 
 
+# ----------------------------
+# Config (.env, ENV_FILE)
+# ----------------------------
 def _load_config() -> Config:
-    """
-    Підтримує різні середовища через ENV_FILE:
-      ENV_FILE=.env.neon python books_etl_v3.py 2025-01-01
-    Якщо ENV_FILE не заданий — читає стандартний .env з поточної директорії.
-    """
+    """Читає змінні з .env або з файлу, вказаного в ENV_FILE."""
     env_file = os.getenv("ENV_FILE")
     if env_file:
         p = Path(env_file)
@@ -55,6 +67,7 @@ CFG = _load_config()
 
 
 def setup_logging() -> None:
+    """Налаштування базового логування."""
     level = CFG("LOG_LEVEL", default="INFO").upper()
     logging.basicConfig(
         level=level,
@@ -62,46 +75,42 @@ def setup_logging() -> None:
     )
 
 
-def retry(
-    fn,
-    *,
-    attempts: int = 3,
-    base_delay: float = 1.0,
-    backoff: float = 2.0,
-    max_delay: float = 20.0,
-    retry_exceptions: tuple[type[BaseException], ...] = (Exception,),
-    op_name: str = "operation",
-):
-    """Проста retry-логіка з exponential backoff + jitter."""
-    last_exc: Optional[BaseException] = None
-    delay = base_delay
-
-    for i in range(1, attempts + 1):
-        try:
-            return fn()
-        except retry_exceptions as exc:  # noqa: BLE001
-            last_exc = exc
-            if i == attempts:
-                break
-
-            jitter = random.uniform(0, 0.2 * delay)
-            sleep_for = min(max_delay, delay + jitter)
-            logger.warning(
-                "%s failed (attempt %d/%d): %s. Retry in %.2fs",
-                op_name,
-                i,
-                attempts,
-                exc,
-                sleep_for,
-            )
-            time.sleep(sleep_for)
-            delay *= backoff
-
-    assert last_exc is not None
-    raise last_exc
+# ----------------------------
+# Helpers
+# ----------------------------
+def _validate_cli_date(date_str: str) -> datetime:
+    """Валідація CLI аргументу YYYY-MM-DD. Повертає datetime (00:00:00)."""
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError as e:
+        raise ValueError("Невірний формат дати. Очікується YYYY-MM-DD") from e
 
 
+def _required_env(host: str, name: str, user: str, password: str) -> None:
+    """Перевіряє обовʼязкові параметри підключення."""
+    missing = [k for k, v in {
+        "DB_HOST": host,
+        "DB_NAME": name,
+        "DB_USER": user,
+        "DB_PASSWORD": password,
+    }.items() if not v]
+    if missing:
+        raise ValueError("Не вказана обов'язкова змінна середовища: " + ", ".join(missing))
+
+
+# ----------------------------
+# DB connect (retry only transient)
+# ----------------------------
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    # Retry тільки transient помилки мережі/каналу.
+    retry=retry_if_exception_type((OperationalError, InterfaceError)),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
 def connect_to_db() -> Engine:
+    """Створює SQLAlchemy Engine і перевіряє з'єднання (SELECT 1)."""
     host = CFG("DB_HOST", default="localhost")
     port = CFG("DB_PORT", default="5432")
     name = CFG("DB_NAME", default="books_db")
@@ -110,15 +119,7 @@ def connect_to_db() -> Engine:
     sslmode = CFG("DB_SSLMODE", default="require")
     channel_binding = CFG("DB_CHANNEL_BINDING", default=None)
 
-    missing = [k for k, v in {
-        "DB_HOST": host,
-        "DB_NAME": name,
-        "DB_USER": user,
-        "DB_PASSWORD": password,
-    }.items() if not v]
-
-    if missing:
-        raise ValueError("Не вказана обов'язкова змінна середовища: " + ", ".join(missing))
+    _required_env(host, name, user, password)
 
     query = {"sslmode": sslmode}
     if channel_binding:
@@ -134,51 +135,40 @@ def connect_to_db() -> Engine:
         query=query,
     )
 
-    def _connect() -> Engine:
-        engine = create_engine(url, pool_pre_ping=True)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return engine
+    engine = create_engine(url, pool_pre_ping=True)
 
-    try:
-        engine = retry(
-            _connect,
-            attempts=int(CFG("DB_CONNECT_ATTEMPTS", default="3")),
-            base_delay=float(CFG("DB_CONNECT_DELAY", default="1.0")),
-            op_name="DB connect",
-            retry_exceptions=(SQLAlchemyError, Exception),
-        )
-        logger.info("Підключення до бази даних успішне")
-        return engine
-    except SQLAlchemyError as e:
-        raise ConnectionError(f"Помилка підключення до БД: {e}") from e
+    # Пробне підключення (ловить неправильний пароль / SSL одразу).
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+
+    logger.info("Підключення до бази даних успішне")
+    return engine
 
 
-def _validate_cli_date(date_str: str) -> datetime:
-    try:
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError as e:
-        raise ValueError("Невірний формат дати. Очікується YYYY-MM-DD") from e
-
-
+# ----------------------------
+# Extract
+# ----------------------------
 def extract_books_iter(engine: Engine, cutoff_dt: datetime, *, chunksize: int) -> Iterator[pd.DataFrame]:
-    """
-    Витягує книги з таблиці books, чанками.
-    Важливо: pyformat плейсхолдер %(cutoff)s (psycopg2).
-    """
+    """Читає books чанками, тримаючи Connection відкритим на час ітерації."""
     sql = """
         SELECT book_id, title, price, genre, stock_quantity, last_updated
         FROM books
         WHERE last_updated >= %(cutoff)s
         ORDER BY last_updated ASC, book_id ASC
     """
+
+    conn = engine.connect()
     try:
-        return pd.read_sql_query(sql, engine, params={"cutoff": cutoff_dt}, chunksize=chunksize)
+        for chunk in pd.read_sql_query(sql, conn, params={"cutoff": cutoff_dt}, chunksize=chunksize):
+            yield chunk
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"Помилка зчитування даних з таблиці books: {e}") from e
+    finally:
+        conn.close()
 
 
 def extract_books(engine: Engine, cutoff_dt: datetime) -> pd.DataFrame:
+    """Читає всі дані одним DataFrame (fallback, якщо chunksize <= 0)."""
     sql = """
         SELECT book_id, title, price, genre, stock_quantity, last_updated
         FROM books
@@ -186,12 +176,17 @@ def extract_books(engine: Engine, cutoff_dt: datetime) -> pd.DataFrame:
         ORDER BY last_updated ASC, book_id ASC
     """
     try:
-        return pd.read_sql_query(sql, engine, params={"cutoff": cutoff_dt})
+        with engine.connect() as conn:
+            return pd.read_sql_query(sql, conn, params={"cutoff": cutoff_dt})
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"Помилка зчитування даних з таблиці books: {e}") from e
 
 
+# ----------------------------
+# Transform
+# ----------------------------
 def transform_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Перетворення даних згідно бізнес-правил з ТЗ."""
     if df.empty:
         return df
 
@@ -203,52 +198,73 @@ def transform_data(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# ----------------------------
+# Load (idempotent + retry only transient)
+# ----------------------------
+def _delete_existing_processed(conn: Connection, book_ids: list[int]) -> None:
+    """Видаляє існуючі записи з books_processed для конкретних book_id (анти-дублікат)."""
+    delete_stmt = text("DELETE FROM books_processed WHERE book_id IN :ids").bindparams(
+        bindparam("ids", expanding=True)
+    )
+    conn.execute(delete_stmt, {"ids": book_ids})
+
+
+def _insert_processed(conn: Connection, df: pd.DataFrame) -> None:
+    """Вставляє дані в books_processed через pandas.to_sql()."""
+    df.to_sql(
+        "books_processed",
+        conn,  # Важливо: Connection, не Engine
+        if_exists="append",
+        index=False,
+        chunksize=1000,
+        method="multi",
+    )
+
+
 def load_data(df: pd.DataFrame, engine: Engine) -> int:
+    """Idempotent load у межах транзакції + retry на transient помилки."""
     if df.empty:
         return 0
 
     cols = ["book_id", "title", "original_price", "rounded_price", "genre", "price_category"]
     to_load = df[cols].copy()
 
+    # Унікальні book_id у поточному чанку.
     book_ids = to_load["book_id"].dropna().astype(int).unique().tolist()
     if not book_ids:
         return 0
 
-    delete_stmt = text("DELETE FROM books_processed WHERE book_id IN :ids").bindparams(
-        bindparam("ids", expanding=True)
+    @retry(
+        stop=stop_after_attempt(int(CFG("DB_WRITE_ATTEMPTS", default="3"))),
+        wait=wait_exponential(multiplier=1, min=1, max=20),
+        retry=retry_if_exception_type((OperationalError, InterfaceError)),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+        reraise=True,
     )
-
     def _do_load() -> int:
+        # engine.begin() -> транзакція (commit/rollback автоматично)
         with engine.begin() as conn:
-            conn.execute(delete_stmt, {"ids": book_ids})
-            to_load.to_sql(
-                "books_processed",
-                conn,
-                if_exists="append",
-                index=False,
-                chunksize=1000,
-                method="multi",
-            )
+            _delete_existing_processed(conn, book_ids)
+            _insert_processed(conn, to_load)
         return len(to_load)
 
     try:
-        return retry(
-            _do_load,
-            attempts=int(CFG("DB_WRITE_ATTEMPTS", default="3")),
-            base_delay=float(CFG("DB_WRITE_DELAY", default="1.0")),
-            op_name="DB load",
-            retry_exceptions=(SQLAlchemyError, Exception),
-        )
-    except Exception as e:  # noqa: BLE001
+        return _do_load()
+    except SQLAlchemyError as e:
         raise RuntimeError(f"Помилка завантаження оброблених даних: {e}") from e
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"Неочікувана помилка при завантаженні: {e}") from e
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def main() -> None:
     setup_logging()
 
     if len(sys.argv) != 2:
-        print("Використання: python books_etl_v3.py YYYY-MM-DD")
-        print("Приклад: python books_etl_v3.py 2025-01-01")
+        print("Використання: python books_etl.py YYYY-MM-DD")
+        print("Приклад: python books_etl.py 2025-01-01")
         sys.exit(1)
 
     cutoff_dt = _validate_cli_date(sys.argv[1])
@@ -304,10 +320,19 @@ def main() -> None:
 
             transformed = transform_data(df)
             loaded_total = load_data(transformed, engine)
+            extracted_total = len(df)
             logger.info("Збережено %d записів в books_processed", loaded_total)
 
-        logger.info("ETL процес завершено успішно (loaded=%d, elapsed=%.2fs)", loaded_total, time.time() - start_ts)
+        logger.info(
+            "ETL процес завершено успішно (extracted=%d loaded=%d, elapsed=%.2fs)",
+            extracted_total,
+            loaded_total,
+            time.time() - start_ts,
+        )
 
+    except ValueError as e:
+        logger.error("Помилка вхідних параметрів: %s", e)
+        sys.exit(1)
     except Exception as e:  # noqa: BLE001
         logger.exception("При виконанні виникла помилка: %s", e)
         sys.exit(1)
