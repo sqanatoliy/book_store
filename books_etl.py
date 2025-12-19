@@ -178,7 +178,7 @@ def extract_books(engine: Engine, cutoff_dt: datetime) -> pd.DataFrame:
     try:
         with engine.connect() as conn:
             return pd.read_sql_query(sql, conn, params={"cutoff": cutoff_dt})
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise RuntimeError(f"Помилка зчитування даних з таблиці books: {e}") from e
 
 

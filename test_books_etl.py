@@ -4,7 +4,6 @@ from datetime import datetime
 from sqlalchemy import create_engine, text
 
 # Імпортуємо функції з вашого скрипта
-# (переконайтесь, що ваш файл називається books_etl.py)
 from books_etl import transform_data, _validate_cli_date, _required_env, load_data
 
 
@@ -41,9 +40,7 @@ def test_transform_data_logic(input_df):
     # 2. Перевіряємо округлення (499.95 -> 500.0 ?)
     # Примітка: round(1) працює як банківське округлення або математичне, залежить від версії.
     # В Pandas .round(1) для 499.95 зазвичай дає 500.0 (float).
-    expected_rounded = [100.0, 1000.0, 500.0] 
-    # Але чекайте, 999.99 round(1) -> 1000.0. 
-    # Давайте перевіримо конкретні значення, які ми очікуємо.
+    #expected_rounded = [100.0, 1000.0, 500.0] 
     
     assert result.loc[0, "rounded_price"] == 100.0
     assert result.loc[1, "rounded_price"] == 1000.0
@@ -109,10 +106,10 @@ def test_required_env_ok():
 
 def test_load_data_real_db_flow(input_df):
     """
-    Тестуємо load_data за допомогою справжньої бази SQLite в пам'яті.
+    Тестуємо load_data за допомогою бази SQLite в пам'яті.
     Це перевіряє логіку транзакцій, видалення та вставки.
     """
-    # 1. Створюємо реальний engine для SQLite в пам'яті
+    # 1. Створюємо engine для SQLite в пам'яті
     engine = create_engine("sqlite:///:memory:")
     
     # 2. Створюємо необхідну таблицю
